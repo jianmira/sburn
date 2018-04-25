@@ -54,11 +54,6 @@ type URLFetcher struct {
 	err     error
 }
 
-type pack struct {
-	r   *http.Response
-	err error
-}
-
 //NewURLFetcher returns a URL Fetcher
 func NewURLFetcher(c *Controller, url string) *URLFetcher {
 	ctx, cancel := context.WithCancel(c.Ctx)
@@ -88,9 +83,6 @@ func (p *URLFetcher) run() error {
 	defer p.wg.Done()
 	defer p.cancel()
 
-	c := make(chan *pack, 1)
-	defer close(c)
-
 	client := &http.Client{}
 	req, _ := http.NewRequest("GET", p.url, nil)
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
@@ -111,55 +103,3 @@ func (p *URLFetcher) run() error {
 	}
 	return nil
 }
-
-/*
-func (p *URLFetcher) run2() error {
-	defer p.wg.Done()
-	defer p.cancel()
-
-	var wg sync.WaitGroup
-
-	c := make(chan *pack, 1)
-	defer close(c)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		client := &http.Client{}
-		req, _ := http.NewRequest("GET", p.url, nil)
-		ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
-		defer cancel()
-		req.WithContext(ctx)
-
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			resp, err := client.Do(req)
-			pack := &pack{resp, err}
-			select {
-			case <-ctx.Done():
-			default:
-				c <- pack
-			}
-		}
-	}()
-
-	select {
-	case <-p.ctx.Done():
-		wg.Wait()
-		return errors.New("Task Canccelled")
-	case ok := <-c:
-		wg.Wait()
-		err := ok.err
-		resp := ok.r
-		if err != nil {
-			fmt.Println("Error ", err)
-			return err
-		}
-		p.resp = resp
-		p.processPage()
-	}
-	return nil
-}
-*/
