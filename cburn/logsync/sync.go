@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,43 +21,107 @@ type URLEntry struct {
 	lastUpdateTime time.Time
 }
 
+// URLQueue is a basic FIFO queue based on a circular list that resizes as needed.
+type urlQueue struct {
+	nodes []*URLEntry
+	size  int
+	head  int
+	tail  int
+	count int
+}
+
+//NewURLQueue returns a new queue with the given initial size.
+func newURLQueue(size int) *urlQueue {
+	return &urlQueue{
+		nodes: make([]*URLEntry, size),
+		size:  size,
+	}
+}
+
+// Push adds a node to the queue.
+func (q *urlQueue) Push(n *URLEntry) {
+	if q.head == q.tail && q.count > 0 {
+		nodes := make([]*URLEntry, len(q.nodes)+q.size)
+		copy(nodes, q.nodes[q.head:])
+		copy(nodes[len(q.nodes)-q.head:], q.nodes[:q.head])
+		q.head = 0
+		q.tail = len(q.nodes)
+		q.nodes = nodes
+	}
+	q.nodes[q.tail] = n
+	q.tail = (q.tail + 1) % len(q.nodes)
+	q.count++
+}
+
+// Pop removes and returns a node from the queue in first to last order.
+func (q *urlQueue) Pop() *URLEntry {
+	if q.count == 0 {
+		return nil
+	}
+	node := q.nodes[q.head]
+	q.head = (q.head + 1) % len(q.nodes)
+	q.count--
+	return node
+}
+
 //URLFetcher is url fetcher
 type URLFetcher struct {
-	ctx context.Context
-	//cancel  context.CancelFunc
-	wg      *sync.WaitGroup
-	done    chan error
-	id      int
-	url     *url.URL
-	subTree chan *URLEntry
-	record  chan *URLEntry
-	timeout time.Duration
-	resp    *http.Response
-	err     error
+	ctx      context.Context
+	done     chan error
+	id       int
+	urlEntry *URLEntry
+	subTree  chan *URLEntry
+	record   chan *URLEntry
+	timeout  time.Duration
+	resp     *http.Response
+	err      error
+}
+
+//URLFetcher is Record fetcher
+type RecordFetcher struct {
+	ctx      context.Context
+	done     chan error
+	id       int
+	urlEntry *URLEntry
+	subUrls  *urlQueue
+	files    map[string][]byte
+	timeout  time.Duration
+	resp     *http.Response
+	err      error
+}
+
+type routineStat struct {
+	routineLauched  int
+	routineReturned int
+	routineDone     chan error
 }
 
 //Controller is the global data
 type Controller struct {
-	ctx               context.Context
-	wg                sync.WaitGroup
-	subTree           chan *URLEntry
-	record            chan *URLEntry
-	urlCache          map[string]*URLEntry
-	heartbeatInterval time.Duration
-	routineLauched    int
-	routineReturned   int
-	routineDone       chan error
+	ctx          context.Context
+	wg           sync.WaitGroup
+	subTree      chan *URLEntry
+	record       chan *URLEntry
+	urlCache     map[string]*URLEntry
+	explorerStat *routineStat
+	recordStat   *routineStat
+}
+
+func newRoutineStat() *routineStat {
+	return &routineStat{
+		routineDone: make(chan error),
+	}
 }
 
 //NewController returns new controller
 func NewController(ctx context.Context) *Controller {
 	return &Controller{
-		ctx:               ctx,
-		subTree:           make(chan *URLEntry),
-		record:            make(chan *URLEntry),
-		urlCache:          make(map[string]*URLEntry),
-		heartbeatInterval: (time.Second),
-		routineDone:       make(chan error),
+		ctx:          ctx,
+		subTree:      make(chan *URLEntry),
+		record:       make(chan *URLEntry),
+		urlCache:     make(map[string]*URLEntry),
+		explorerStat: newRoutineStat(),
+		recordStat:   newRoutineStat(),
 	}
 }
 
@@ -79,13 +145,16 @@ func (c *Controller) AddNewURLEntry(urlEntry *URLEntry) {
 
 //WaitJobDone waits for all child go routines exit
 func (c *Controller) WaitJobDone() {
-	fmt.Println("wait for job done")
+	//fmt.Println("wait for job done")
 	c.wg.Wait()
 }
 
 func (c *Controller) startURL(urlFetcher *URLFetcher) {
-	c.wg.Add(1)
 	go urlFetcher.run()
+}
+
+func (c *Controller) startRecord(recordFether *RecordFetcher) {
+	go recordFether.run()
 }
 
 //StartExplorer starts explorer
@@ -96,36 +165,82 @@ func (c *Controller) StartExplorer() {
 
 func (c *Controller) startExplorer() {
 	defer c.wg.Done()
+	s := c.explorerStat
 loop:
 	for {
 		select {
 		case <-c.ctx.Done():
-			break loop
+			select {
+			case <-s.routineDone:
+				s.routineReturned++
+			default:
+				if s.routineReturned >= s.routineLauched {
+					break loop
+				}
+			}
 		case urlEntry := <-c.subTree:
 			if c.urlNewerThanCache(urlEntry) {
-				fmt.Printf("create new URL[%d] : %s", c.routineLauched, urlEntry.url.String())
-				c.routineLauched++
-				p := c.newURLFetcher(urlEntry.url)
+				fmt.Printf("Explorer[%d] : %s %s\n", s.routineLauched, urlEntry.url.String(), urlEntry.lastUpdateTime)
+				s.routineLauched++
+				p := c.newURLFetcher(urlEntry)
 				c.startURL(p)
 			} else {
-				fmt.Println("Existing URL :", urlEntry.url.String())
+				//fmt.Println("Existing URL :", urlEntry.url.String())
 			}
-		case <-c.routineDone:
-			c.routineReturned++
-			if c.routineReturned >= c.routineLauched {
+		case <-s.routineDone:
+			s.routineReturned++
+			if s.routineReturned >= s.routineLauched {
+				break loop
+			}
+		}
+	}
+	fmt.Printf("\nCburn Explorer Summary : %d routine launched  %d routine returned\n", s.routineLauched, s.routineReturned)
+}
+
+//StartCburnProcessor starts record process
+func (c *Controller) StartCburnProcessor() {
+	c.wg.Add(1)
+	go c.startCburnProcessor()
+}
+
+func (c *Controller) startCburnProcessor() {
+	defer c.wg.Done()
+	s := c.recordStat
+loop:
+	for {
+		select {
+		case <-c.ctx.Done():
+			select {
+			case <-s.routineDone:
+				s.routineReturned++
+			default:
+				if s.routineReturned >= s.routineLauched {
+					break loop
+				}
+			}
+		case record := <-c.record:
+			s.routineLauched++
+			fmt.Printf("Processor[%d] : %s %s\n", s.routineLauched, record.url.String(), record.lastUpdateTime)
+			r := c.newRecordFetcher(record)
+			c.startRecord(r)
+		case <-s.routineDone:
+			s.routineReturned++
+			if s.routineReturned >= s.routineLauched {
 				break loop
 			}
 		}
 
 	}
-	fmt.Printf("startExplorer Exit %d routine launched  ", c.routineReturned)
+	fmt.Printf("\nCburn Proccessor Summary : %d routine launched  %d routine returned\n", s.routineLauched, s.routineReturned)
 }
 
 func (c *Controller) urlNewerThanCache(urlEntry *URLEntry) bool {
 	//TBD
 	urlCache, ok := c.urlCache[urlEntry.url.String()]
 	if ok {
-		_ = urlCache
+		if urlEntry.lastUpdateTime.Before(urlCache.lastUpdateTime) {
+			return true
+		}
 		return false
 	} else {
 		c.urlCache[urlEntry.url.String()] = urlEntry
@@ -133,27 +248,35 @@ func (c *Controller) urlNewerThanCache(urlEntry *URLEntry) bool {
 	}
 }
 
-func (c *Controller) newURLFetcher(url *url.URL) *URLFetcher {
+func (c *Controller) newURLFetcher(urlEntry *URLEntry) *URLFetcher {
 	//ctx, cancel := context.WithCancel(c.ctx)
 
 	return &URLFetcher{
-		id:  c.routineLauched,
-		ctx: c.ctx,
-		//cancel:  cancel,
-		done:    c.routineDone,
-		wg:      &c.wg,
-		url:     url,
-		timeout: time.Second * 2,
-		subTree: c.subTree,
-		record:  c.record,
+		id:       c.explorerStat.routineLauched,
+		ctx:      c.ctx,
+		done:     c.explorerStat.routineDone,
+		urlEntry: urlEntry,
+		timeout:  time.Second * 2,
+		subTree:  c.subTree,
+		record:   c.record,
 	}
 }
 
-//func (p *URLFetcher) stop() {
-//p.cancel()
-//}
+func (c *Controller) newRecordFetcher(urlEntry *URLEntry) *RecordFetcher {
+	r := &RecordFetcher{
+		id:       c.recordStat.routineLauched,
+		ctx:      c.ctx,
+		done:     c.recordStat.routineDone,
+		urlEntry: urlEntry,
+		subUrls:  newURLQueue(100),
+		timeout:  time.Second * 2,
+		files:    make(map[string][]byte),
+	}
+	r.genNewRecordEntry(urlEntry)
+	return r
+}
 
-func (p *URLFetcher) genNewURLRecord(urlEntry *URLEntry) {
+func (p *URLFetcher) genNewURLEntry(urlEntry *URLEntry) {
 	if urlEntry.url.Scheme == "http" || urlEntry.url.Scheme == "https" {
 		select {
 		case <-p.ctx.Done():
@@ -172,8 +295,68 @@ func createURLEntryFromLink(t html.Token) (string, error) {
 	return "", errors.New("No Href attribute in the link")
 }
 
+//CreateTime builds url time
+func CreateTime(ts string) time.Time {
+	regex, _ := regexp.Compile("([0-9]+)-([A-Za-z]+)-[0-9]{2}([0-9]{2})[\t ]*([0-9]{2}:[0-9]{2})")
+	tss := regex.FindStringSubmatch(ts)
+	if len(tss) == 5 {
+		ts = fmt.Sprintf("%s %s %s %s PDT", tss[1], tss[2], tss[3], tss[4])
+		tm, _ := time.Parse(time.RFC822, ts)
+		return tm
+	} else {
+		tm := time.Now()
+		return tm
+	}
+
+}
+
+func getURLTime(z *html.Tokenizer) (time.Time, html.TokenType) {
+	tt := z.Token().Type
+
+	for tt != html.EndTagToken {
+		if tt == html.ErrorToken {
+			return time.Now(), tt
+		}
+		tt = z.Next()
+	}
+
+	for tt != html.TextToken {
+		if tt == html.ErrorToken {
+			return time.Now(), tt
+		}
+		tt = z.Next()
+	}
+
+	tm := CreateTime(string(z.Text()))
+
+	return tm, tt
+}
+
+func isCburnFolder(urlEntries []*URLEntry) bool {
+	for _, urlEntry := range urlEntries {
+		if strings.HasSuffix(urlEntry.url.String(), "stage1.conf") ||
+			strings.HasSuffix(urlEntry.url.String(), "stage2.conf") {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *URLFetcher) dispatchURLs(urlEntries []*URLEntry) {
+	for _, urlEntry := range urlEntries {
+		if strings.HasSuffix(urlEntry.url.String(), "/") {
+			p.genNewURLEntry(urlEntry)
+		}
+	}
+}
+
+func (p *URLFetcher) dispatchCburn() {
+	p.record <- p.urlEntry
+}
+
 func (p *URLFetcher) processPage() {
 	defer p.resp.Body.Close()
+	var urls []*URLEntry
 	ct := p.resp.Header.Get("Content-Type")
 	if strings.Contains(ct, "UTF-8") == false {
 		return
@@ -200,29 +383,38 @@ loop:
 					if err == nil {
 						u, err := url.Parse(l)
 						if err == nil {
+							var tm time.Time
 							if u.IsAbs() {
-								fmt.Println("abs :", u.String())
-								p.genNewURLRecord(&URLEntry{u, time.Now()})
+								tm, tt = getURLTime(z)
+								urls = append(urls, &URLEntry{u, tm})
 							} else {
-								if len(u.Path) > 0 && !strings.Contains(p.url.Path, u.Path) {
-									u = p.url.ResolveReference(u)
-									fmt.Println("ref : ", u.String())
-								}
+								if len(u.Path) > 0 && !strings.Contains(p.urlEntry.url.Path, u.Path) {
+									u = p.urlEntry.url.ResolveReference(u)
+									tm, tt = getURLTime(z)
+									urls = append(urls, &URLEntry{u, tm})
 
-								p.genNewURLRecord(&URLEntry{u, time.Now()})
+								}
 							}
 						}
 					}
 				}
+				if tt == html.ErrorToken {
+					break loop
+				}
 			}
 		}
 	}
+	if isCburnFolder(urls) {
+		p.dispatchCburn()
+	} else {
+		p.dispatchURLs(urls)
+	}
+
 }
 
 func (p *URLFetcher) onCompletion() {
 	defer func() {
 		p.done <- p.err
-		p.wg.Done()
 	}()
 }
 
@@ -231,7 +423,7 @@ func (p *URLFetcher) run() {
 	defer p.onCompletion()
 
 	client := &http.Client{}
-	req, err := http.NewRequest("GET", p.url.String(), nil)
+	req, err := http.NewRequest("GET", p.urlEntry.url.String(), nil)
 	if err != nil {
 		p.err = err
 		return
@@ -243,12 +435,10 @@ func (p *URLFetcher) run() {
 
 	select {
 	case <-ctx.Done():
-		p.err = errors.New("Task Canccelled")
 		return
 	default:
 		resp, err := client.Do(req)
 		if err != nil {
-			//fmt.Println("Error ", err)
 			p.err = err
 			return
 		}
@@ -256,4 +446,132 @@ func (p *URLFetcher) run() {
 		p.processPage()
 	}
 	return
+}
+
+func (p *RecordFetcher) genNewRecordEntry(urlEntry *URLEntry) {
+	p.subUrls.Push(urlEntry)
+}
+
+func (p *RecordFetcher) processPage(resp *http.Response) {
+	defer resp.Body.Close()
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "UTF-8") == false {
+		return
+	}
+	z := html.NewTokenizer(resp.Body)
+loop:
+	for {
+		select {
+		case <-p.ctx.Done():
+			break loop
+		default:
+			tt := z.Next()
+
+			switch {
+			case tt == html.ErrorToken:
+				// End of the document, we're done
+				break loop
+			case tt == html.StartTagToken:
+				t := z.Token()
+
+				isAnchor := t.Data == "a"
+				if isAnchor {
+					l, err := createURLEntryFromLink(t)
+					if err == nil {
+						u, err := url.Parse(l)
+						if err == nil {
+							var tm time.Time
+							if u.IsAbs() {
+								tm, tt = getURLTime(z)
+								p.subUrls.Push(&URLEntry{u, tm})
+
+							} else {
+								if len(u.Path) > 0 {
+									u = p.urlEntry.url.ResolveReference(u)
+									if !strings.Contains(u.Path, p.urlEntry.url.Path) {
+										tm, tt = getURLTime(z)
+										p.subUrls.Push(&URLEntry{u, tm})
+									}
+								}
+							}
+						}
+					}
+				}
+				if tt == html.ErrorToken {
+					break loop
+				}
+			}
+		}
+	}
+}
+
+func (p *RecordFetcher) processFile(filepath string, resp *http.Response) {
+	defer resp.Body.Close()
+	data, _ := ioutil.ReadAll(resp.Body)
+	p.files[filepath] = data
+}
+
+func (p *RecordFetcher) onCompletion() {
+	defer func() {
+		p.done <- p.err
+	}()
+}
+
+func (p *RecordFetcher) runSignle() bool {
+
+	urlEntry := p.subUrls.Pop()
+	if urlEntry == nil {
+		return false
+	}
+
+	if !strings.HasPrefix(urlEntry.url.String(), p.urlEntry.url.String()) {
+		return true
+	}
+
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", urlEntry.url.String(), nil)
+	if err != nil {
+		p.err = err
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
+	defer cancel()
+	req.WithContext(ctx)
+
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+		resp, err := client.Do(req)
+		if err != nil {
+			p.err = err
+			return true
+		}
+		if strings.HasSuffix(urlEntry.url.String(), "/") {
+			p.processPage(resp)
+		} else {
+			filepath := strings.TrimPrefix(urlEntry.url.String(), p.urlEntry.url.String())
+			p.processFile(filepath, resp)
+			fmt.Println("Downloaded File ", filepath)
+		}
+
+	}
+	return true
+}
+
+func (p *RecordFetcher) run() {
+	defer p.onCompletion()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		default:
+			if !p.runSignle() {
+				return
+			}
+
+		}
+	}
 }

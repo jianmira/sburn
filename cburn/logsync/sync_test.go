@@ -14,6 +14,12 @@ func TestSyncURL(t *testing.T) {
 	u := logsync.NewURLEntry("http://10.2.1.154/burnin/")
 	c := logsync.NewController(ctx)
 	c.StartExplorer()
+	c.StartCburnProcessor()
 	c.AddNewURLEntry(u)
 	c.WaitJobDone()
+}
+
+func TestURLTime(t *testing.T) {
+	s := "                 18-Apr-2016 08:39    -"
+	logsync.CreateTime(s)
 }
