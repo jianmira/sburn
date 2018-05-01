@@ -2,6 +2,8 @@ package logsync_test
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/jianmira/sburn/cburn/logsync"
@@ -22,4 +24,17 @@ func TestSyncURL(t *testing.T) {
 func TestURLTime(t *testing.T) {
 	s := "                 18-Apr-2016 08:39    -"
 	logsync.CreateTime(s)
+}
+
+func TestMatch(t *testing.T) {
+	s := "SMN=\"Supermicro\"\nSPN=\"SYS-6019U-TR4T\"\n"
+	//s1 := "Key=Value"
+	r, _ := regexp.Compile(`([\w-]+)=\"([\w-]+)\"`)
+	attrs := r.FindAllString(s, -1)
+	for _, attr := range attrs {
+		p := r.FindStringSubmatch(attr)
+		fmt.Printf("%v\n", p)
+	}
+	fmt.Println(s)
+
 }

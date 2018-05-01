@@ -64,36 +64,36 @@ func (q *urlQueue) Pop() *URLEntry {
 	return node
 }
 
-//URLFetcher is url fetcher
-type URLFetcher struct {
-	ctx      context.Context
-	done     chan error
+//Fetcher is the base class for *Fetcher
+type Fetcher struct {
 	id       int
 	urlEntry *URLEntry
-	subTree  chan *URLEntry
-	record   chan *URLEntry
+	ctx      context.Context
+	done     chan *Fetcher
 	timeout  time.Duration
 	resp     *http.Response
 	err      error
 }
 
-//URLFetcher is Record fetcher
+//URLFetcher is url fetcher
+type URLFetcher struct {
+	Fetcher
+	subTree chan *URLEntry
+	record  chan *URLEntry
+}
+
+//RecordFetcher is Record fetcher
 type RecordFetcher struct {
-	ctx      context.Context
-	done     chan error
-	id       int
-	urlEntry *URLEntry
-	subUrls  *urlQueue
-	files    map[string][]byte
-	timeout  time.Duration
-	resp     *http.Response
-	err      error
+	Fetcher
+	subUrls     *urlQueue
+	files       map[string][]byte
+	recordAttrs map[string]string
 }
 
 type routineStat struct {
 	routineLauched  int
 	routineReturned int
-	routineDone     chan error
+	routineDone     chan *Fetcher
 	routineMax      int
 }
 
@@ -110,7 +110,7 @@ type Controller struct {
 
 func newRoutineStat(max int) *routineStat {
 	return &routineStat{
-		routineDone: make(chan error),
+		routineDone: make(chan *Fetcher),
 		routineMax:  max,
 	}
 }
@@ -122,7 +122,7 @@ func NewController(ctx context.Context) *Controller {
 		subTree:      make(chan *URLEntry, 5000),
 		record:       make(chan *URLEntry, 1000),
 		urlCache:     make(map[string]*URLEntry),
-		explorerStat: newRoutineStat(1000),
+		explorerStat: newRoutineStat(10000),
 		recordStat:   newRoutineStat(1000),
 	}
 }
@@ -173,18 +173,19 @@ loop:
 		select {
 		case <-c.ctx.Done():
 			select {
-			case <-s.routineDone:
+			case fetcher := <-s.routineDone:
 				s.routineReturned++
+				fmt.Printf("-Explorer|End[ %d| %d] : %s\n", fetcher.id, s.routineLauched-s.routineReturned, fetcher.urlEntry.url.String())
 			default:
 				if s.routineReturned >= s.routineLauched {
 					break loop
 				}
 			}
 
-		case <-s.routineDone:
+		case fetcher := <-s.routineDone:
 			s.routineReturned++
 			if s.routineReturned >= s.routineLauched {
-				close(c.record)
+				fmt.Printf("Explorer|End[ %d| %d] : %s\n", fetcher.id, s.routineLauched-s.routineReturned, fetcher.urlEntry.url.String())
 				break loop
 			}
 		default:
@@ -192,7 +193,7 @@ loop:
 				select {
 				case urlEntry := <-c.subTree:
 					if c.urlNewerThanCache(urlEntry) {
-						fmt.Printf("Explorer[%d] : %s %s\n", s.routineLauched, urlEntry.url.String(), urlEntry.lastUpdateTime)
+						fmt.Printf("Explorer|Start[ %d| %d] : %s %s\n", s.routineLauched, s.routineLauched-s.routineReturned, urlEntry.url.String(), urlEntry.lastUpdateTime)
 						s.routineLauched++
 						p := c.newURLFetcher(urlEntry)
 						c.startURL(p)
@@ -220,22 +221,24 @@ loop:
 		select {
 		case <-c.ctx.Done():
 			select {
-			case <-s.routineDone:
+			case fetcher := <-s.routineDone:
+				fmt.Printf("-Processor|End[ %d| %d] : %s\n", fetcher.id, s.routineLauched-s.routineReturned, fetcher.urlEntry.url.String())
 				s.routineReturned++
 			default:
 				if s.routineReturned >= s.routineLauched {
 					break loop
 				}
 			}
-		case <-s.routineDone:
+		case fetcher := <-s.routineDone:
 			s.routineReturned++
+			fmt.Printf("Processor|End[ %d| %d] : %s\n", fetcher.id, s.routineLauched-s.routineReturned, fetcher.urlEntry.url.String())
 		default:
 			if s.routineLauched-s.routineReturned < s.routineMax {
 				select {
 				case record, ok := <-c.record:
 					if ok {
 						s.routineLauched++
-						fmt.Printf("Processor[%d] : %s %s\n", s.routineLauched, record.url.String(), record.lastUpdateTime)
+						fmt.Printf("Processor|Start[ %d| %d] : %s %s\n", s.routineLauched, s.routineLauched-s.routineReturned, record.url.String(), record.lastUpdateTime)
 						r := c.newRecordFetcher(record)
 						c.startRecord(r)
 					} else {
@@ -278,25 +281,30 @@ func (c *Controller) newURLFetcher(urlEntry *URLEntry) *URLFetcher {
 	//ctx, cancel := context.WithCancel(c.ctx)
 
 	return &URLFetcher{
-		id:       c.explorerStat.routineLauched,
-		ctx:      c.ctx,
-		done:     c.explorerStat.routineDone,
-		urlEntry: urlEntry,
-		timeout:  time.Second * 2,
-		subTree:  c.subTree,
-		record:   c.record,
+		Fetcher: Fetcher{
+			id:       c.explorerStat.routineLauched,
+			ctx:      c.ctx,
+			done:     c.explorerStat.routineDone,
+			urlEntry: urlEntry,
+			timeout:  time.Second * 2,
+		},
+		subTree: c.subTree,
+		record:  c.record,
 	}
 }
 
 func (c *Controller) newRecordFetcher(urlEntry *URLEntry) *RecordFetcher {
 	r := &RecordFetcher{
-		id:       c.recordStat.routineLauched,
-		ctx:      c.ctx,
-		done:     c.recordStat.routineDone,
-		urlEntry: urlEntry,
-		subUrls:  newURLQueue(100),
-		timeout:  time.Second * 2,
-		files:    make(map[string][]byte),
+		Fetcher: Fetcher{
+			id:       c.recordStat.routineLauched,
+			ctx:      c.ctx,
+			done:     c.recordStat.routineDone,
+			urlEntry: urlEntry,
+			timeout:  time.Second * 2,
+		},
+		subUrls:     newURLQueue(100),
+		files:       make(map[string][]byte),
+		recordAttrs: make(map[string]string),
 	}
 	r.genNewRecordEntry(urlEntry)
 	return r
@@ -452,7 +460,7 @@ func (p *URLFetcher) processPage() {
 }
 
 func (p *URLFetcher) onCompletion() {
-	p.done <- p.err
+	p.done <- &p.Fetcher
 }
 
 //Run starts the real work
@@ -466,7 +474,7 @@ func (p *URLFetcher) run() {
 		p.err = err
 		return
 	}
-	//req.Header.Set("Connection", "close")
+	req.Header.Set("Connection", "close")
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
 	defer cancel()
 	req.WithContext(ctx)
@@ -530,7 +538,7 @@ loop:
 									u = urlEntry.url.ResolveReference(u)
 									tm, tt = getURLTime(z)
 									p.subUrls.Push(&URLEntry{u, tm})
-									fmt.Println("Push :", u.String())
+									//fmt.Println("Push :", u.String())
 								}
 							}
 						}
@@ -551,19 +559,19 @@ func (p *RecordFetcher) processFile(filepath string, resp *http.Response) {
 }
 
 func (p *RecordFetcher) onCompletion() {
-	p.done <- p.err
+	p.done <- &p.Fetcher
 }
 
-func (p *RecordFetcher) runSingle() bool {
+func (p *RecordFetcher) runSingle() (bool, bool) {
 
 	urlEntry := p.subUrls.Pop()
 	if urlEntry == nil {
-		fmt.Println("Finshed :", p.urlEntry.url.String())
-		return true
+		fmt.Println("Finished :", p.urlEntry.url.String())
+		return true, true
 	}
 
 	if !strings.HasPrefix(urlEntry.url.String(), p.urlEntry.url.String()) {
-		return false
+		return false, false
 	}
 
 	client := &http.Client{}
@@ -571,22 +579,22 @@ func (p *RecordFetcher) runSingle() bool {
 
 	if err != nil {
 		p.err = err
-		return false
+		return false, false
 	}
-	//req.Header.Set("Connection", "close")
+	req.Header.Set("Connection", "close")
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
 	defer cancel()
 	req.WithContext(ctx)
 
 	select {
 	case <-ctx.Done():
-		return false
+		return false, true
 	default:
 		resp, err := client.Do(req)
 		if err != nil {
 			p.subUrls.Push(urlEntry)
 			p.err = err
-			return false
+			return false, false
 		}
 		if strings.HasSuffix(urlEntry.url.String(), "/") {
 			fmt.Println("Parse Page ", urlEntry.url.String())
@@ -598,7 +606,30 @@ func (p *RecordFetcher) runSingle() bool {
 		}
 
 	}
-	return false
+	return false, false
+}
+
+func (p *RecordFetcher) getIns() {
+	r, _ := regexp.Compile(`([\w-]+)=\"([\w-]+)\"`)
+	for name, data := range p.files {
+		if strings.HasPrefix(name, "ins-") {
+			attrs := r.FindAllString(string(data), -1)
+			for _, attr := range attrs {
+				ri := r.FindStringSubmatch(attr)
+				p.recordAttrs[ri[1]] = ri[2]
+			}
+		}
+	}
+	data, ok := p.files["sysconf.cfg"]
+	if ok {
+		attrs := r.FindAllString(string(data), -1)
+		for _, attr := range attrs {
+			ri := r.FindStringSubmatch(attr)
+			p.recordAttrs[ri[1]] = ri[2]
+		}
+		fmt.Printf("Found : %s/%s\n", p.recordAttrs["BOARD_NAME"], p.recordAttrs["SYSTEM_PRODUCT_NAME"])
+	}
+	return
 }
 
 func (p *RecordFetcher) run() {
@@ -609,7 +640,10 @@ loop:
 		case <-p.ctx.Done():
 			break loop
 		default:
-			if p.runSingle() {
+			if finished, exit := p.runSingle(); exit {
+				if finished {
+					p.getIns()
+				}
 				break loop
 			}
 
