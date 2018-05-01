@@ -119,11 +119,11 @@ func newRoutineStat(max int) *routineStat {
 func NewController(ctx context.Context) *Controller {
 	return &Controller{
 		ctx:          ctx,
-		subTree:      make(chan *URLEntry),
-		record:       make(chan *URLEntry),
+		subTree:      make(chan *URLEntry, 5000),
+		record:       make(chan *URLEntry, 1000),
 		urlCache:     make(map[string]*URLEntry),
-		explorerStat: newRoutineStat(10),
-		recordStat:   newRoutineStat(50),
+		explorerStat: newRoutineStat(1000),
+		recordStat:   newRoutineStat(1000),
 	}
 }
 
@@ -308,6 +308,7 @@ func (p *URLFetcher) genNewURLEntry(urlEntry *URLEntry) {
 		case <-p.ctx.Done():
 			return
 		case p.subTree <- urlEntry:
+			return
 		}
 	}
 }
@@ -377,64 +378,70 @@ func (p *URLFetcher) dispatchURLs(urlEntries []*URLEntry) {
 }
 
 func (p *URLFetcher) dispatchCburn() {
+	fmt.Println("Dispatch cburn : ", p.urlEntry.url.String())
 	select {
 	case <-p.ctx.Done():
 		return
 	case p.record <- p.urlEntry:
-
+		return
 	}
 }
 
 func (p *URLFetcher) processPage() {
-	defer p.resp.Body.Close()
+
 	var urls []*URLEntry
 	ct := p.resp.Header.Get("Content-Type")
 	if strings.Contains(ct, "UTF-8") == false {
+		p.resp.Body.Close()
 		return
 	}
 	z := html.NewTokenizer(p.resp.Body)
-loop:
-	for {
-		select {
-		case <-p.ctx.Done():
-			break loop
-		default:
-			tt := z.Next()
 
-			switch {
-			case tt == html.ErrorToken:
-				// End of the document, we're done
+	func() {
+		defer p.resp.Body.Close()
+	loop:
+		for {
+			select {
+			case <-p.ctx.Done():
 				break loop
-			case tt == html.StartTagToken:
-				t := z.Token()
+			default:
+				tt := z.Next()
 
-				isAnchor := t.Data == "a"
-				if isAnchor {
-					l, err := createURLEntryFromLink(t)
-					if err == nil {
-						u, err := url.Parse(l)
+				switch {
+				case tt == html.ErrorToken:
+					// End of the document, we're done
+					break loop
+				case tt == html.StartTagToken:
+					t := z.Token()
+
+					isAnchor := t.Data == "a"
+					if isAnchor {
+						l, err := createURLEntryFromLink(t)
 						if err == nil {
-							var tm time.Time
-							if u.IsAbs() {
-								tm, tt = getURLTime(z)
-								urls = append(urls, &URLEntry{u, tm})
-							} else {
-								if len(u.Path) > 0 && !strings.Contains(p.urlEntry.url.Path, u.Path) {
-									u = p.urlEntry.url.ResolveReference(u)
+							u, err := url.Parse(l)
+							if err == nil {
+								var tm time.Time
+								if u.IsAbs() {
 									tm, tt = getURLTime(z)
 									urls = append(urls, &URLEntry{u, tm})
-
+								} else {
+									if len(u.Path) > 0 && !strings.Contains(p.urlEntry.url.Path, u.Path) {
+										u = p.urlEntry.url.ResolveReference(u)
+										tm, tt = getURLTime(z)
+										urls = append(urls, &URLEntry{u, tm})
+										//fmt.Println(u.String())
+									}
 								}
 							}
 						}
 					}
-				}
-				if tt == html.ErrorToken {
-					break loop
+					if tt == html.ErrorToken {
+						break loop
+					}
 				}
 			}
 		}
-	}
+	}()
 
 	if isCburnFolder(urls) {
 		p.dispatchCburn()
@@ -445,9 +452,7 @@ loop:
 }
 
 func (p *URLFetcher) onCompletion() {
-	defer func() {
-		p.done <- p.err
-	}()
+	p.done <- p.err
 }
 
 //Run starts the real work
@@ -457,6 +462,7 @@ func (p *URLFetcher) run() {
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", p.urlEntry.url.String(), nil)
 	if err != nil {
+		//wrong format, don't have to reinsert the URL for retry
 		p.err = err
 		return
 	}
@@ -471,13 +477,14 @@ func (p *URLFetcher) run() {
 	default:
 		resp, err := client.Do(req)
 		if err != nil {
+			fmt.Println(err)
+			p.genNewURLEntry(p.urlEntry)
 			p.err = err
 			return
 		}
 		p.resp = resp
 		p.processPage()
 	}
-	return
 }
 
 func (p *RecordFetcher) genNewRecordEntry(urlEntry *URLEntry) {
@@ -520,10 +527,10 @@ loop:
 							} else {
 								//fmt.Printf("Checking %s under %s\n", u.String(), urlEntry.url.Path)
 								if len(u.Path) > 0 && !strings.Contains(urlEntry.url.Path, u.Path) {
-									u = p.urlEntry.url.ResolveReference(u)
+									u = urlEntry.url.ResolveReference(u)
 									tm, tt = getURLTime(z)
 									p.subUrls.Push(&URLEntry{u, tm})
-									//fmt.Println("Push :", u.String())
+									fmt.Println("Push :", u.String())
 								}
 							}
 						}
@@ -544,24 +551,19 @@ func (p *RecordFetcher) processFile(filepath string, resp *http.Response) {
 }
 
 func (p *RecordFetcher) onCompletion() {
-	select {
-	case <-p.ctx.Done():
-		return
-	case p.done <- p.err:
-		return
-	}
+	p.done <- p.err
 }
 
-func (p *RecordFetcher) runSingle() int {
+func (p *RecordFetcher) runSingle() bool {
 
 	urlEntry := p.subUrls.Pop()
 	if urlEntry == nil {
 		fmt.Println("Finshed :", p.urlEntry.url.String())
-		return 1
+		return true
 	}
 
 	if !strings.HasPrefix(urlEntry.url.String(), p.urlEntry.url.String()) {
-		return 2
+		return false
 	}
 
 	client := &http.Client{}
@@ -569,7 +571,7 @@ func (p *RecordFetcher) runSingle() int {
 
 	if err != nil {
 		p.err = err
-		return 3
+		return false
 	}
 	//req.Header.Set("Connection", "close")
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
@@ -577,14 +579,14 @@ func (p *RecordFetcher) runSingle() int {
 	req.WithContext(ctx)
 
 	select {
-	case <-p.ctx.Done():
-		return 4
+	case <-ctx.Done():
+		return false
 	default:
 		resp, err := client.Do(req)
 		if err != nil {
-			fmt.Println(err)
+			p.subUrls.Push(urlEntry)
 			p.err = err
-			return 5
+			return false
 		}
 		if strings.HasSuffix(urlEntry.url.String(), "/") {
 			fmt.Println("Parse Page ", urlEntry.url.String())
@@ -592,11 +594,11 @@ func (p *RecordFetcher) runSingle() int {
 		} else {
 			filepath := strings.TrimPrefix(urlEntry.url.String(), p.urlEntry.url.String())
 			p.processFile(filepath, resp)
-			fmt.Println("Downloaded File ", filepath)
+			fmt.Println("Downloaded File ", filepath, " ", p.urlEntry.url.Path)
 		}
 
 	}
-	return 0
+	return false
 }
 
 func (p *RecordFetcher) run() {
@@ -607,8 +609,7 @@ loop:
 		case <-p.ctx.Done():
 			break loop
 		default:
-			if reason := p.runSingle(); reason > 0 {
-				fmt.Println("RecordFetcher Exit reason ", reason)
+			if p.runSingle() {
 				break loop
 			}
 
