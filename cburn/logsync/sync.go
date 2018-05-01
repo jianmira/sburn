@@ -94,6 +94,7 @@ type routineStat struct {
 	routineLauched  int
 	routineReturned int
 	routineDone     chan error
+	routineMax      int
 }
 
 //Controller is the global data
@@ -107,9 +108,10 @@ type Controller struct {
 	recordStat   *routineStat
 }
 
-func newRoutineStat() *routineStat {
+func newRoutineStat(max int) *routineStat {
 	return &routineStat{
 		routineDone: make(chan error),
+		routineMax:  max,
 	}
 }
 
@@ -120,8 +122,8 @@ func NewController(ctx context.Context) *Controller {
 		subTree:      make(chan *URLEntry),
 		record:       make(chan *URLEntry),
 		urlCache:     make(map[string]*URLEntry),
-		explorerStat: newRoutineStat(),
-		recordStat:   newRoutineStat(),
+		explorerStat: newRoutineStat(10),
+		recordStat:   newRoutineStat(50),
 	}
 }
 
@@ -178,21 +180,28 @@ loop:
 					break loop
 				}
 			}
-		case urlEntry := <-c.subTree:
-			if c.urlNewerThanCache(urlEntry) {
-				fmt.Printf("Explorer[%d] : %s %s\n", s.routineLauched, urlEntry.url.String(), urlEntry.lastUpdateTime)
-				s.routineLauched++
-				p := c.newURLFetcher(urlEntry)
-				c.startURL(p)
-			} else {
-				//fmt.Println("Existing URL :", urlEntry.url.String())
-			}
+
 		case <-s.routineDone:
 			s.routineReturned++
 			if s.routineReturned >= s.routineLauched {
+				close(c.record)
 				break loop
 			}
+		default:
+			if s.routineLauched-s.routineReturned < s.routineMax {
+				select {
+				case urlEntry := <-c.subTree:
+					if c.urlNewerThanCache(urlEntry) {
+						fmt.Printf("Explorer[%d] : %s %s\n", s.routineLauched, urlEntry.url.String(), urlEntry.lastUpdateTime)
+						s.routineLauched++
+						p := c.newURLFetcher(urlEntry)
+						c.startURL(p)
+					}
+				default:
+				}
+			}
 		}
+
 	}
 	fmt.Printf("\nCburn Explorer Summary : %d routine launched  %d routine returned\n", s.routineLauched, s.routineReturned)
 }
@@ -218,15 +227,32 @@ loop:
 					break loop
 				}
 			}
-		case record := <-c.record:
-			s.routineLauched++
-			fmt.Printf("Processor[%d] : %s %s\n", s.routineLauched, record.url.String(), record.lastUpdateTime)
-			r := c.newRecordFetcher(record)
-			c.startRecord(r)
 		case <-s.routineDone:
 			s.routineReturned++
-			if s.routineReturned >= s.routineLauched {
-				break loop
+		default:
+			if s.routineLauched-s.routineReturned < s.routineMax {
+				select {
+				case record, ok := <-c.record:
+					if ok {
+						s.routineLauched++
+						fmt.Printf("Processor[%d] : %s %s\n", s.routineLauched, record.url.String(), record.lastUpdateTime)
+						r := c.newRecordFetcher(record)
+						c.startRecord(r)
+					} else {
+						if s.routineReturned >= s.routineLauched {
+							break loop
+						}
+						select {
+						case <-s.routineDone:
+							s.routineReturned++
+						default:
+							if s.routineReturned >= s.routineLauched {
+								break loop
+							}
+						}
+					}
+				default:
+				}
 			}
 		}
 
@@ -351,7 +377,12 @@ func (p *URLFetcher) dispatchURLs(urlEntries []*URLEntry) {
 }
 
 func (p *URLFetcher) dispatchCburn() {
-	p.record <- p.urlEntry
+	select {
+	case <-p.ctx.Done():
+		return
+	case p.record <- p.urlEntry:
+
+	}
 }
 
 func (p *URLFetcher) processPage() {
@@ -404,6 +435,7 @@ loop:
 			}
 		}
 	}
+
 	if isCburnFolder(urls) {
 		p.dispatchCburn()
 	} else {
@@ -428,7 +460,7 @@ func (p *URLFetcher) run() {
 		p.err = err
 		return
 	}
-
+	//req.Header.Set("Connection", "close")
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
 	defer cancel()
 	req.WithContext(ctx)
@@ -452,7 +484,7 @@ func (p *RecordFetcher) genNewRecordEntry(urlEntry *URLEntry) {
 	p.subUrls.Push(urlEntry)
 }
 
-func (p *RecordFetcher) processPage(resp *http.Response) {
+func (p *RecordFetcher) processPage(urlEntry *URLEntry, resp *http.Response) {
 	defer resp.Body.Close()
 	ct := resp.Header.Get("Content-Type")
 	if strings.Contains(ct, "UTF-8") == false {
@@ -486,12 +518,12 @@ loop:
 								p.subUrls.Push(&URLEntry{u, tm})
 
 							} else {
-								if len(u.Path) > 0 {
+								//fmt.Printf("Checking %s under %s\n", u.String(), urlEntry.url.Path)
+								if len(u.Path) > 0 && !strings.Contains(urlEntry.url.Path, u.Path) {
 									u = p.urlEntry.url.ResolveReference(u)
-									if !strings.Contains(u.Path, p.urlEntry.url.Path) {
-										tm, tt = getURLTime(z)
-										p.subUrls.Push(&URLEntry{u, tm})
-									}
+									tm, tt = getURLTime(z)
+									p.subUrls.Push(&URLEntry{u, tm})
+									//fmt.Println("Push :", u.String())
 								}
 							}
 						}
@@ -512,44 +544,51 @@ func (p *RecordFetcher) processFile(filepath string, resp *http.Response) {
 }
 
 func (p *RecordFetcher) onCompletion() {
-	defer func() {
-		p.done <- p.err
-	}()
+	select {
+	case <-p.ctx.Done():
+		return
+	case p.done <- p.err:
+		return
+	}
 }
 
-func (p *RecordFetcher) runSignle() bool {
+func (p *RecordFetcher) runSingle() int {
 
 	urlEntry := p.subUrls.Pop()
 	if urlEntry == nil {
-		return false
+		fmt.Println("Finshed :", p.urlEntry.url.String())
+		return 1
 	}
 
 	if !strings.HasPrefix(urlEntry.url.String(), p.urlEntry.url.String()) {
-		return true
+		return 2
 	}
 
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", urlEntry.url.String(), nil)
+
 	if err != nil {
 		p.err = err
-		return true
+		return 3
 	}
-
+	//req.Header.Set("Connection", "close")
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
 	defer cancel()
 	req.WithContext(ctx)
 
 	select {
-	case <-ctx.Done():
-		return false
+	case <-p.ctx.Done():
+		return 4
 	default:
 		resp, err := client.Do(req)
 		if err != nil {
+			fmt.Println(err)
 			p.err = err
-			return true
+			return 5
 		}
 		if strings.HasSuffix(urlEntry.url.String(), "/") {
-			p.processPage(resp)
+			fmt.Println("Parse Page ", urlEntry.url.String())
+			p.processPage(urlEntry, resp)
 		} else {
 			filepath := strings.TrimPrefix(urlEntry.url.String(), p.urlEntry.url.String())
 			p.processFile(filepath, resp)
@@ -557,19 +596,20 @@ func (p *RecordFetcher) runSignle() bool {
 		}
 
 	}
-	return true
+	return 0
 }
 
 func (p *RecordFetcher) run() {
 	defer p.onCompletion()
-
+loop:
 	for {
 		select {
 		case <-p.ctx.Done():
-			return
+			break loop
 		default:
-			if !p.runSignle() {
-				return
+			if reason := p.runSingle(); reason > 0 {
+				fmt.Println("RecordFetcher Exit reason ", reason)
+				break loop
 			}
 
 		}
