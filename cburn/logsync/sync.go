@@ -67,12 +67,13 @@ func (q *urlQueue) Pop() *URLEntry {
 //Fetcher is the base class for *Fetcher
 type Fetcher struct {
 	id       int
+	client   *clientConn
 	urlEntry *URLEntry
 	ctx      context.Context
 	done     chan *Fetcher
 	timeout  time.Duration
-	resp     *http.Response
-	err      error
+	//resp     *http.Response
+	//err      error
 }
 
 //URLFetcher is url fetcher
@@ -101,11 +102,55 @@ type routineStat struct {
 type Controller struct {
 	ctx          context.Context
 	wg           sync.WaitGroup
+	client       *clientConn
 	subTree      chan *URLEntry
 	record       chan *URLEntry
 	urlCache     map[string]*URLEntry
 	explorerStat *routineStat
 	recordStat   *routineStat
+}
+type clientConn struct {
+	client       *http.Client
+	maxPoolSize  int
+	cSemaphore   chan int
+	reqPerSecond int
+	rateLimiter  *time.Ticker
+}
+
+func (c *clientConn) Do(req *http.Request) (*http.Response, error) {
+	if c.maxPoolSize > 0 {
+		c.cSemaphore <- 1 // Grab a connection from our pool
+		defer func() {
+			<-c.cSemaphore // Defer release our connection back to the pool
+		}()
+	}
+
+	if c.reqPerSecond > 0 {
+		<-c.rateLimiter.C // Block until a signal is emitted from the rateLimiter
+	}
+
+	resp, err := c.client.Do(req)
+	return resp, err
+}
+
+func newClientConn(maxPoolSize int, reqPerSecond int) *clientConn {
+	var cSemaphore chan int
+	var rateLimiter *time.Ticker
+
+	if maxPoolSize > 0 {
+		cSemaphore = make(chan int, maxPoolSize)
+	}
+	if reqPerSecond > 0 {
+		rateLimiter = time.NewTicker(time.Second / time.Duration(reqPerSecond))
+	}
+	return &clientConn{
+		client:       &http.Client{},
+		maxPoolSize:  maxPoolSize,
+		cSemaphore:   cSemaphore,
+		reqPerSecond: reqPerSecond,
+		rateLimiter:  rateLimiter,
+	}
+
 }
 
 func newRoutineStat(max int) *routineStat {
@@ -119,11 +164,12 @@ func newRoutineStat(max int) *routineStat {
 func NewController(ctx context.Context) *Controller {
 	return &Controller{
 		ctx:          ctx,
-		subTree:      make(chan *URLEntry, 5000),
+		client:       newClientConn(5000, 0),
+		subTree:      make(chan *URLEntry, 1000),
 		record:       make(chan *URLEntry, 1000),
 		urlCache:     make(map[string]*URLEntry),
-		explorerStat: newRoutineStat(10000),
-		recordStat:   newRoutineStat(1000),
+		explorerStat: newRoutineStat(0),
+		recordStat:   newRoutineStat(0),
 	}
 }
 
@@ -189,7 +235,7 @@ loop:
 				break loop
 			}
 		default:
-			if s.routineLauched-s.routineReturned < s.routineMax {
+			if s.routineMax == 0 || s.routineLauched-s.routineReturned < s.routineMax {
 				select {
 				case urlEntry := <-c.subTree:
 					if c.urlNewerThanCache(urlEntry) {
@@ -233,7 +279,7 @@ loop:
 			s.routineReturned++
 			fmt.Printf("Processor|End[ %d| %d] : %s\n", fetcher.id, s.routineLauched-s.routineReturned, fetcher.urlEntry.url.String())
 		default:
-			if s.routineLauched-s.routineReturned < s.routineMax {
+			if s.routineMax == 0 || s.routineLauched-s.routineReturned < s.routineMax {
 				select {
 				case record, ok := <-c.record:
 					if ok {
@@ -283,6 +329,7 @@ func (c *Controller) newURLFetcher(urlEntry *URLEntry) *URLFetcher {
 	return &URLFetcher{
 		Fetcher: Fetcher{
 			id:       c.explorerStat.routineLauched,
+			client:   c.client,
 			ctx:      c.ctx,
 			done:     c.explorerStat.routineDone,
 			urlEntry: urlEntry,
@@ -297,6 +344,7 @@ func (c *Controller) newRecordFetcher(urlEntry *URLEntry) *RecordFetcher {
 	r := &RecordFetcher{
 		Fetcher: Fetcher{
 			id:       c.recordStat.routineLauched,
+			client:   c.client,
 			ctx:      c.ctx,
 			done:     c.recordStat.routineDone,
 			urlEntry: urlEntry,
@@ -395,18 +443,18 @@ func (p *URLFetcher) dispatchCburn() {
 	}
 }
 
-func (p *URLFetcher) processPage() {
+func (p *URLFetcher) processPage(resp *http.Response) {
 
 	var urls []*URLEntry
-	ct := p.resp.Header.Get("Content-Type")
+	ct := resp.Header.Get("Content-Type")
 	if strings.Contains(ct, "UTF-8") == false {
-		p.resp.Body.Close()
+		resp.Body.Close()
 		return
 	}
-	z := html.NewTokenizer(p.resp.Body)
+	z := html.NewTokenizer(resp.Body)
 
 	func() {
-		defer p.resp.Body.Close()
+		defer resp.Body.Close()
 	loop:
 		for {
 			select {
@@ -466,15 +514,13 @@ func (p *URLFetcher) onCompletion() {
 //Run starts the real work
 func (p *URLFetcher) run() {
 	defer p.onCompletion()
-
-	client := &http.Client{}
 	req, err := http.NewRequest("GET", p.urlEntry.url.String(), nil)
 	if err != nil {
 		//wrong format, don't have to reinsert the URL for retry
-		p.err = err
+		//p.err = err
 		return
 	}
-	req.Header.Set("Connection", "close")
+	//req.Header.Set("Connection", "close")
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
 	defer cancel()
 	req.WithContext(ctx)
@@ -483,15 +529,14 @@ func (p *URLFetcher) run() {
 	case <-ctx.Done():
 		return
 	default:
-		resp, err := client.Do(req)
+		resp, err := p.client.Do(req)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("Http Connection Error (Retry Scheduled) : ", err)
 			p.genNewURLEntry(p.urlEntry)
-			p.err = err
+			//p.err = err
 			return
 		}
-		p.resp = resp
-		p.processPage()
+		p.processPage(resp)
 	}
 }
 
@@ -574,14 +619,13 @@ func (p *RecordFetcher) runSingle() (bool, bool) {
 		return false, false
 	}
 
-	client := &http.Client{}
 	req, err := http.NewRequest("GET", urlEntry.url.String(), nil)
 
 	if err != nil {
-		p.err = err
+		//p.err = err
 		return false, false
 	}
-	req.Header.Set("Connection", "close")
+	//req.Header.Set("Connection", "close")
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
 	defer cancel()
 	req.WithContext(ctx)
@@ -590,10 +634,11 @@ func (p *RecordFetcher) runSingle() (bool, bool) {
 	case <-ctx.Done():
 		return false, true
 	default:
-		resp, err := client.Do(req)
+		resp, err := p.client.Do(req)
 		if err != nil {
+			fmt.Println("Http Connection Error (Retry Scheduled) : ", err)
 			p.subUrls.Push(urlEntry)
-			p.err = err
+			//p.err = err
 			return false, false
 		}
 		if strings.HasSuffix(urlEntry.url.String(), "/") {
