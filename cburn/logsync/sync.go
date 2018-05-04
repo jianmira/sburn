@@ -12,8 +12,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mongodb/mongo-go-driver/bson"
+	"github.com/mongodb/mongo-go-driver/mongo"
 	"golang.org/x/net/html"
 )
+
+var dburl = "mongodb://127.0.0.1:27017"
+
+//CburnFile defines the cburn file type
+type CburnFile struct {
+	contentType string
+	data        []byte
+}
 
 //URLEntry is the URL to be explored
 type URLEntry struct {
@@ -87,7 +97,7 @@ type URLFetcher struct {
 type RecordFetcher struct {
 	Fetcher
 	subUrls     *urlQueue
-	files       map[string][]byte
+	files       map[string]*CburnFile
 	recordAttrs map[string]string
 }
 
@@ -100,14 +110,15 @@ type routineStat struct {
 
 //Controller is the global data
 type Controller struct {
-	ctx          context.Context
-	wg           sync.WaitGroup
-	client       *clientConn
-	subTree      chan *URLEntry
-	record       chan *URLEntry
-	urlCache     map[string]*URLEntry
-	explorerStat *routineStat
-	recordStat   *routineStat
+	ctx            context.Context
+	wg             sync.WaitGroup
+	explorerClient *clientConn
+	recordClient   *clientConn
+	subTree        chan *URLEntry
+	record         chan *URLEntry
+	urlCache       map[string]*URLEntry
+	explorerStat   *routineStat
+	recordStat     *routineStat
 }
 type clientConn struct {
 	client       *http.Client
@@ -163,13 +174,14 @@ func newRoutineStat(max int) *routineStat {
 //NewController returns new controller
 func NewController(ctx context.Context) *Controller {
 	return &Controller{
-		ctx:          ctx,
-		client:       newClientConn(5000, 0),
-		subTree:      make(chan *URLEntry, 1000),
-		record:       make(chan *URLEntry, 1000),
-		urlCache:     make(map[string]*URLEntry),
-		explorerStat: newRoutineStat(0),
-		recordStat:   newRoutineStat(0),
+		ctx:            ctx,
+		explorerClient: newClientConn(1000, 10000),
+		recordClient:   newClientConn(1000, 10000),
+		subTree:        make(chan *URLEntry, 1000),
+		record:         make(chan *URLEntry, 1000),
+		urlCache:       make(map[string]*URLEntry),
+		explorerStat:   newRoutineStat(0),
+		recordStat:     newRoutineStat(0),
 	}
 }
 
@@ -188,6 +200,15 @@ func (c *Controller) AddNewURLEntry(urlEntry *URLEntry) {
 	case <-c.ctx.Done():
 		return
 	case c.subTree <- urlEntry:
+	}
+}
+
+//AddNewRecordURLEntry adds new URL entry to the queue
+func (c *Controller) AddNewRecordURLEntry(urlEntry *URLEntry) {
+	select {
+	case <-c.ctx.Done():
+		return
+	case c.record <- urlEntry:
 	}
 }
 
@@ -329,11 +350,11 @@ func (c *Controller) newURLFetcher(urlEntry *URLEntry) *URLFetcher {
 	return &URLFetcher{
 		Fetcher: Fetcher{
 			id:       c.explorerStat.routineLauched,
-			client:   c.client,
+			client:   c.explorerClient,
 			ctx:      c.ctx,
 			done:     c.explorerStat.routineDone,
 			urlEntry: urlEntry,
-			timeout:  time.Second * 2,
+			timeout:  time.Second * 30,
 		},
 		subTree: c.subTree,
 		record:  c.record,
@@ -341,17 +362,18 @@ func (c *Controller) newURLFetcher(urlEntry *URLEntry) *URLFetcher {
 }
 
 func (c *Controller) newRecordFetcher(urlEntry *URLEntry) *RecordFetcher {
+
 	r := &RecordFetcher{
 		Fetcher: Fetcher{
 			id:       c.recordStat.routineLauched,
-			client:   c.client,
+			client:   c.recordClient,
 			ctx:      c.ctx,
 			done:     c.recordStat.routineDone,
 			urlEntry: urlEntry,
-			timeout:  time.Second * 2,
+			timeout:  time.Second * 30,
 		},
 		subUrls:     newURLQueue(100),
-		files:       make(map[string][]byte),
+		files:       make(map[string]*CburnFile),
 		recordAttrs: make(map[string]string),
 	}
 	r.genNewRecordEntry(urlEntry)
@@ -599,8 +621,10 @@ loop:
 
 func (p *RecordFetcher) processFile(filepath string, resp *http.Response) {
 	defer resp.Body.Close()
+	ct := resp.Header.Get("Content-Type")
 	data, _ := ioutil.ReadAll(resp.Body)
-	p.files[filepath] = data
+
+	p.files[filepath] = &CburnFile{ct, data}
 }
 
 func (p *RecordFetcher) onCompletion() {
@@ -656,18 +680,18 @@ func (p *RecordFetcher) runSingle() (bool, bool) {
 
 func (p *RecordFetcher) getIns() {
 	r, _ := regexp.Compile(`([\w-]+)=\"([\w-]+)\"`)
-	for name, data := range p.files {
+	for name, file := range p.files {
 		if strings.HasPrefix(name, "ins-") {
-			attrs := r.FindAllString(string(data), -1)
+			attrs := r.FindAllString(string(file.data), -1)
 			for _, attr := range attrs {
 				ri := r.FindStringSubmatch(attr)
 				p.recordAttrs[ri[1]] = ri[2]
 			}
 		}
 	}
-	data, ok := p.files["sysconf.cfg"]
+	file, ok := p.files["sysconf.cfg"]
 	if ok {
-		attrs := r.FindAllString(string(data), -1)
+		attrs := r.FindAllString(string(file.data), -1)
 		for _, attr := range attrs {
 			ri := r.FindStringSubmatch(attr)
 			p.recordAttrs[ri[1]] = ri[2]
@@ -675,6 +699,30 @@ func (p *RecordFetcher) getIns() {
 		fmt.Printf("Found : %s/%s\n", p.recordAttrs["BOARD_NAME"], p.recordAttrs["SYSTEM_PRODUCT_NAME"])
 	}
 	return
+}
+
+func (p *RecordFetcher) saveToDB() {
+	dbclient, _ := mongo.NewClient(dburl)
+	db := dbclient.Database("sburn")
+	coll := db.Collection("cburn_record")
+
+	var attrElems []*bson.Element
+	for name, attr := range p.recordAttrs {
+		attrElems = append(attrElems, bson.EC.String(name, string(attr)))
+	}
+	var fileElems []*bson.Element
+	fileElems = append(fileElems, bson.EC.SubDocumentFromElements("attrib", attrElems...))
+	for name, file := range p.files {
+		if strings.Contains(file.contentType, "text/plain") {
+			fileElems = append(fileElems, bson.EC.String(name, string(file.data)))
+		} else {
+			fileElems = append(fileElems, bson.EC.Binary(name, file.data))
+		}
+	}
+	coll.InsertOne(
+		context.Background(),
+		bson.NewDocument(fileElems...))
+	dbclient.Disconnect(context.Background())
 }
 
 func (p *RecordFetcher) run() {
@@ -688,6 +736,8 @@ loop:
 			if finished, exit := p.runSingle(); exit {
 				if finished {
 					p.getIns()
+					fmt.Println("DB :", p.Fetcher.id, " ", p.Fetcher.urlEntry.url)
+					p.saveToDB()
 				}
 				break loop
 			}
